@@ -1,0 +1,295 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { trimEnd } from 'lodash';
+import { v4 as uuidv4 } from 'uuid';
+import { from, Observable } from 'rxjs';
+import { first, switchMap } from 'rxjs/operators';
+import {
+  formatTimePickerDate,
+  getDataSourceEngineCapabilities,
+  Query,
+  TimeBounds,
+  UI_SETTINGS,
+} from '../../../data/common';
+import {
+  DataPublicPluginStart,
+  IndexPatternsContract,
+  IOpenSearchDashboardsSearchRequest,
+  IOpenSearchDashboardsSearchResponse,
+  ISearchOptions,
+  SearchInterceptor,
+  SearchInterceptorDeps,
+} from '../../../data/public';
+import {
+  API,
+  DATASET,
+  EnhancedFetchContext,
+  fetch,
+  isPPLSearchQuery,
+  QueryAggConfig,
+  queryEndsWithHead,
+  SEARCH_STRATEGY,
+} from '../../common';
+import { QueryEnhancementsPluginStartDependencies } from '../types';
+import { IUiSettingsClient } from '../../../../core/public';
+import { PPLFilterUtils } from './filters';
+
+export const DEFAULT_PPL_ASYNC_HEAD_SIZE = 10000;
+
+// Commands after which `sort - <dataset time field>` must not be appended: the user already ordered
+// or limited the result, or the command replaced the row type. chart and timechart emit a time
+// column of their own naming (`@timestamp`, or chart's `over` argument), so sorting on the dataset's
+// field turns a working query into `Field [<field>] not found`.
+const DEFAULT_SORT_BLOCKING_COMMANDS = [
+  'sort',
+  'stats',
+  'head',
+  'rare',
+  'top',
+  'rename',
+  'chart',
+  'timechart',
+];
+const SORT_BLOCKING_COMMAND_REGEX = new RegExp(
+  `\\|\\s*(${DEFAULT_SORT_BLOCKING_COMMANDS.join('|')})\\b`,
+  'i'
+);
+
+const canAppendDefaultSort = (queryString: string): boolean => {
+  const masked = queryString
+    .replace(/\[.*?\]/g, (match) => '\0'.repeat(match.length))
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (match) => '\0'.repeat(match.length));
+
+  const hasFieldsProjection = /\|\s*fields\b/i.test(masked) && !/\|\s*fields\s+\*/i.test(masked);
+
+  return !hasFieldsProjection && !SORT_BLOCKING_COMMAND_REGEX.test(masked);
+};
+
+export class PPLSearchInterceptor extends SearchInterceptor {
+  private static readonly filterManagerSupportedAppNames = ['dashboards'];
+
+  protected queryService!: DataPublicPluginStart['query'];
+  protected aggsService!: DataPublicPluginStart['search']['aggs'];
+  private uiSettings!: IUiSettingsClient;
+  private indexPatterns!: IndexPatternsContract;
+
+  constructor(deps: SearchInterceptorDeps) {
+    super(deps);
+
+    deps.startServices.then(([coreStart, depsStart]) => {
+      this.queryService = (depsStart as QueryEnhancementsPluginStartDependencies).data.query;
+      this.aggsService = (depsStart as QueryEnhancementsPluginStartDependencies).data.search.aggs;
+      this.uiSettings = coreStart.uiSettings;
+      this.indexPatterns = (
+        depsStart as QueryEnhancementsPluginStartDependencies
+      ).data.indexPatterns;
+    });
+  }
+
+  protected runSearch(
+    request: IOpenSearchDashboardsSearchRequest,
+    signal?: AbortSignal,
+    strategy?: string
+  ): Observable<IOpenSearchDashboardsSearchResponse> {
+    const { id, ...searchRequest } = request;
+    const isAsync = strategy === SEARCH_STRATEGY.PPL_ASYNC;
+    const context: EnhancedFetchContext = {
+      http: this.deps.http,
+      path: trimEnd(`${API.SEARCH}/${strategy}`),
+      signal,
+      body: {
+        pollQueryResultsParams: request.params?.pollQueryResultsParams,
+        timeRange: request.params?.body?.timeRange,
+        ...(!isAsync && { queryId: uuidv4() }),
+      },
+    };
+
+    return from(this.buildQuery(request)).pipe(
+      switchMap((query) =>
+        fetch(context, this.appendDefaultSort(query), this.getAggConfig(searchRequest, query))
+      )
+    );
+  }
+
+  public search(request: IOpenSearchDashboardsSearchRequest, options: ISearchOptions) {
+    const dataset = this.getQuery(request).dataset;
+    const datasetType = dataset?.type;
+    let strategy = datasetType === DATASET.S3 ? SEARCH_STRATEGY.PPL_ASYNC : SEARCH_STRATEGY.PPL;
+
+    if (datasetType) {
+      const datasetTypeConfig = this.queryService.queryString
+        .getDatasetService()
+        .getType(datasetType);
+      strategy = datasetTypeConfig?.getSearchOptions?.(dataset).strategy ?? strategy;
+
+      if (
+        dataset?.timeFieldName &&
+        datasetTypeConfig?.languageOverrides?.PPL?.hideDatePicker === false
+      ) {
+        // If hideDatePicker is false, pass time filters to search strategy to insert them.
+        request.params = {
+          ...request.params,
+          body: {
+            ...request.params.body,
+            timeRange: this.queryService.timefilter.timefilter.getTime(),
+          },
+        };
+      }
+    }
+
+    return this.runSearch(request, options.abortSignal, strategy);
+  }
+
+  private getQuery(request: IOpenSearchDashboardsSearchRequest): Query {
+    // Use query from request if available, otherwise fall back to queryStringManager
+    return request.params?.body?.query?.queries?.[0] || this.queryService.queryString.getQuery();
+  }
+
+  private async buildQuery(request: IOpenSearchDashboardsSearchRequest, options?: any) {
+    const query = this.getQuery(request);
+    // Only append filters if query is running search command (e.g. not describe command)
+    if (!isPPLSearchQuery(query)) return query;
+
+    const whereCommands: string[] = [];
+
+    const skipFilters = request.params?.body?.skipFilters;
+
+    const appId = await this.application.currentAppId$.pipe(first()).toPromise();
+    if (
+      !skipFilters &&
+      appId &&
+      PPLSearchInterceptor.filterManagerSupportedAppNames.includes(appId)
+    ) {
+      const filters = this.queryService.filterManager.getFilters();
+      const index = request.params?.index
+        ? this.indexPatterns.getByTitle(request.params.index, true)
+        : undefined;
+
+      const whereCommand = PPLFilterUtils.convertFiltersToWhereClause(
+        filters,
+        index,
+        this.uiSettings.get(UI_SETTINGS.COURIER_IGNORE_FILTER_IF_FIELD_NOT_IN_INDEX)
+      );
+      whereCommands.push(whereCommand);
+    }
+
+    const datasetService = this.queryService.queryString.getDatasetService();
+    const dataset = query.dataset;
+
+    // Check if skipTimeFilter is set in the search request fields
+    const skipTimeFilter = request.params?.body?.skipTimeFilter;
+
+    let timeBounds: TimeBounds | undefined;
+
+    if (
+      dataset &&
+      dataset.timeFieldName &&
+      !skipTimeFilter && // Skip time filters if skipTimeFilter is true
+      // Skip adding time filters if hideDatePicker is false. Let search strategy insert time filters.
+      datasetService.getType(dataset.type)?.languageOverrides?.PPL?.hideDatePicker !== false
+    ) {
+      // Prefer an explicit time range passed and fall back to the global timefilter.
+      const timeRange =
+        request.params?.body?.timeRange ?? this.queryService.timefilter.timefilter.getTime();
+      // One call for both: a relative range such as `now-15m` resolves to a different millisecond on
+      // every parse, so asking twice would let the clause and the hint describe different windows.
+      const { clause, bounds } = PPLFilterUtils.getTimeFilter(
+        dataset.timeFieldName,
+        timeRange,
+        dataset.dataSource?.engineType ?? dataset.dataSource?.type
+      );
+      whereCommands.push(clause);
+      // The same window out of band, so the engine can skip indices that cannot hold data in it. A
+      // hint only -- the clause above still filters, and the engine narrows just the outermost
+      // source, which is the one this clause constrains. Off switch because skipping indices narrows
+      // the merged mapping too, so a field only the skipped indices map stops resolving. Whether the
+      // cluster acts on them is its own call, via plugins.query.pruning.enabled -- on by default
+      // from 3.9; a cluster older than that has no such setting and ignores these fields outright.
+      if (this.uiSettings?.get(UI_SETTINGS.QUERY_ENHANCEMENTS_INDEX_PRUNING, true) ?? true) {
+        timeBounds = bounds;
+      }
+    }
+    const queryWithFilters = whereCommands.reduce(PPLFilterUtils.insertWhereCommand, query.query);
+
+    const finalQuery =
+      query.dataset?.type === DATASET.S3 && !queryEndsWithHead(queryWithFilters)
+        ? `${queryWithFilters} | head ${DEFAULT_PPL_ASYNC_HEAD_SIZE}`
+        : queryWithFilters;
+
+    return {
+      ...query,
+      query: finalQuery,
+      ...(timeBounds && {
+        time_field: timeBounds.timeField,
+        start_time: timeBounds.start,
+        end_time: timeBounds.end,
+      }),
+    };
+  }
+
+  /**
+   * Appends a default descending sort on the time field to match legacy Discover behavior,
+   * unless the query already sorts, aggregates, projects specific fields, or limits results.
+   * Applied only to the results query, not to the histogram aggregation query.
+   */
+  private appendDefaultSort(query: Query): Query {
+    if (
+      !isPPLSearchQuery(query) ||
+      !query.dataset?.timeFieldName ||
+      !canAppendDefaultSort(query.query)
+    ) {
+      return query;
+    }
+
+    return {
+      ...query,
+      query: `${query.query} | sort - \`${query.dataset.timeFieldName}\``,
+    };
+  }
+
+  // PPL aggregations are not in use for the histogram anymore
+  private getAggConfig(request: IOpenSearchDashboardsSearchRequest, query: Query) {
+    const { aggs } = request.params.body;
+    if (!aggs || !query.dataset || !query.dataset.timeFieldName) return;
+
+    // Some engines (e.g. legacy Elasticsearch / Open Distro) have no `span()` grouping expression in
+    // the PPL `stats` by-clause, so the histogram aggregation query fails to parse. Skip emitting the
+    // agg config for those engines; the main query still runs.
+    const engineType = query.dataset.dataSource?.engineType ?? query.dataset.dataSource?.type;
+    if (!getDataSourceEngineCapabilities(engineType).supportsPplSpan) return;
+
+    const aggsConfig: QueryAggConfig = {};
+    const { fromDate, toDate } = formatTimePickerDate(
+      this.queryService.timefilter.timefilter.getTime(),
+      'YYYY-MM-DD HH:mm:ss.SSS'
+    );
+    Object.entries(aggs as Record<number, any>).forEach(([key, value]) => {
+      const aggTypeKeys = Object.keys(value);
+      if (aggTypeKeys.length === 0) {
+        return aggsConfig;
+      }
+      const aggTypeKey = aggTypeKeys[0];
+      if (aggTypeKey === 'date_histogram') {
+        aggsConfig[aggTypeKey] = {
+          ...value[aggTypeKey],
+        };
+        aggsConfig.qs = {
+          [key]: `${query.query} | stats count() by span(${query.dataset!.timeFieldName}, ${
+            value[aggTypeKey].fixed_interval ??
+            value[aggTypeKey].calendar_interval ??
+            this.aggsService.calculateAutoTimeExpression({
+              from: fromDate,
+              to: toDate,
+              mode: 'absolute',
+            })
+          })`,
+        };
+      }
+    });
+
+    return aggsConfig;
+  }
+}
